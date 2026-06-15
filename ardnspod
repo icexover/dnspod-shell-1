@@ -37,13 +37,86 @@ export arErrCodeUnchanged=0
 
 export arIsCreateRecord=0
 
+# Retry configuration for API calls
+# arRetryCount: number of retry attempts (0 = no retry, just the initial attempt)
+# arRetryDelay: seconds to wait between retries
+
+export arRetryCount=3
+export arRetryDelay=5
+
+# Log file path. If set, logs will also be written to this file.
+# Leave empty to only output to stderr (default behavior).
+
+export arLogFile=""
+
+# Webhook URL for failure notifications (e.g., DingTalk robot webhook).
+# Leave empty to disable notifications.
+
+export arWebhookUrl=""
+
+# Dry-run mode. If set to 1, no actual API calls will be made.
+# Only print what would be done. Useful for debugging.
+
+export arDryRun=${arDryRun:-0}
+
+# Status tracking arrays (used internally for summary report)
+# These are populated by arDdnsCheck during execution
+
+export arStatusSuccess=""
+export arStatusFailed=""
+
 ################################################################### logger ##
 
-# Output log to stderr
+# Output log to stderr and optionally to log file
+# Adds timestamp prefix when writing to file
 
 arLog() {
 
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+
     >&2 echo "$@"
+
+    if [ -n "$arLogFile" ]; then
+        echo "[$timestamp] $*" >> "$arLogFile"
+    fi
+
+}
+
+################################################################### notification ##
+
+# Send webhook notification (supports DingTalk robot format and generic JSON POST)
+# Args: message
+
+arNotify() {
+
+    local msg="$1"
+
+    if [ -z "$arWebhookUrl" ]; then
+        return 0
+    fi
+
+    local payload
+    # DingTalk robot format: {"msgtype":"text","text":{"content":"..."}}
+    payload="{\"msgtype\":\"text\",\"text\":{\"content\":\"[ardnspod] $msg\"}}"
+
+    arLog "> arNotify - Sending webhook notification"
+
+    if [ "$arDryRun" = "1" ]; then
+        arLog "> arNotify - [DRY-RUN] Would send: $payload"
+        return 0
+    fi
+
+    local result
+    result=$(arRequest "$arWebhookUrl" "$payload" 2>/dev/null)
+
+    if [ $? -ne 0 ]; then
+        arLog "> arNotify - Failed to send webhook notification"
+        return 1
+    fi
+
+    arLog "> arNotify - Webhook notification sent"
+    return 0
 
 }
 
@@ -267,15 +340,71 @@ arDevIp6() {
 
 ################################################################### dnspod api ##
 
-# Dnspod Bridge
+# Dnspod Bridge with retry support
 # Args: interface data
 
 arDdnsApi() {
 
-    local dnsapi="https://dnsapi.cn/${1:?'Info.Version'}"
+    local api="${1:?'Info.Version'}"
+    local dnsapi="https://dnsapi.cn/${api}"
     local params="login_token=$arToken&format=json&lang=en&$2"
 
-    arRequest "$dnsapi" "$params"
+    if [ "$arDryRun" = "1" ]; then
+        arLog "> arDdnsApi - [DRY-RUN] Would call: $dnsapi"
+        arLog "> arDdnsApi - [DRY-RUN] With params: $params"
+        # Return a fake successful response for dry-run
+        echo '{"status":{"code":"1","message":""},"records":[{"id":"99999","value":"0.0.0.0"}]}'
+        return 0
+    fi
+
+    local attempt=0
+    local maxAttempts=$((arRetryCount + 1))
+    local result
+    local exitCode
+
+    while [ $attempt -lt $maxAttempts ]; do
+        attempt=$((attempt + 1))
+
+        result=$(arRequest "$dnsapi" "$params")
+        exitCode=$?
+
+        if [ $exitCode -eq 0 ] && [ -n "$result" ]; then
+            # Check if the API itself returned an error code
+            local apiCode
+            apiCode=$(echo "$result" | sed 's/.*"code":"\([0-9]*\)".*/\1/')
+
+            # Code "1" means success in DNSPod API
+            if [ "$apiCode" = "1" ]; then
+                echo "$result"
+                return 0
+            fi
+
+            # API returned an error - log and potentially retry for specific transient errors
+            local apiMsg
+            apiMsg=$(echo "$result" | sed 's/.*,"message":"\([^"]*\)".*/\1/')
+
+            if [ $attempt -lt $maxAttempts ]; then
+                arLog "> arDdnsApi - Attempt $attempt/$maxAttempts failed: $apiMsg, retrying in ${arRetryDelay}s..."
+                sleep "$arRetryDelay"
+            else
+                arLog "> arDdnsApi - All $maxAttempts attempts failed: $apiMsg"
+                echo "$result"
+                return 1
+            fi
+        else
+            # Network or curl/wget failure - always retry
+            if [ $attempt -lt $maxAttempts ]; then
+                arLog "> arDdnsApi - Attempt $attempt/$maxAttempts failed (network error), retrying in ${arRetryDelay}s..."
+                sleep "$arRetryDelay"
+            else
+                arLog "> arDdnsApi - All $maxAttempts attempts failed (network error)"
+                echo "$result"
+                return 1
+            fi
+        fi
+    done
+
+    return 1
 
 }
 
@@ -362,7 +491,7 @@ arDdnsUpdate() {
         return $arErrCodeUnchanged
     else
         arLog "> arDdnsUpdate - updated: $recordIp" # updated event
-        if [ -n "$lastRecordIpFile" ]; then
+        if [ -n "$lastRecordIpFile" ] && [ "$arDryRun" != "1" ]; then
             echo $recordIp > $lastRecordIpFile
         fi
         return 0
@@ -384,7 +513,9 @@ arDdnsCheck() {
     local recordId
     local recordType
 
-    arLog "=== Check $2.$1 ==="
+    local domainLabel="$2.$1"
+
+    arLog "=== Check $domainLabel ==="
     arLog "Fetching Host Ip"
 
     if   [ "$3" = "6" ] && [ -n "$4" ]; then
@@ -410,6 +541,8 @@ arDdnsCheck() {
         arLog "> Record Type: $recordType"
     else
         arLog "$hostIp"
+        arStatusFailed="${arStatusFailed}${domainLabel}(${recordType}): failed to get host ip;"
+        arNotify "FAILED: $domainLabel ($recordType) - failed to get host ip"
         return $errCode
     fi
 
@@ -425,18 +558,35 @@ arDdnsCheck() {
         errCode=$?
         if [ $errCode -eq 0 ]; then
             arLog "> Record Id: $recordId"
+            arStatusSuccess="${arStatusSuccess}${domainLabel}(${recordType}): created $hostIp;"
             return 0
         else
             arLog "$recordId"
+            arStatusFailed="${arStatusFailed}${domainLabel}(${recordType}): failed to create record;"
+            arNotify "FAILED: $domainLabel ($recordType) - failed to create record: $recordId"
             return $errCode
         fi
     else
         arLog "$recordId"
+        arStatusFailed="${arStatusFailed}${domainLabel}(${recordType}): failed to lookup record;"
+        arNotify "FAILED: $domainLabel ($recordType) - failed to lookup record: $recordId"
         return $errCode
     fi
 
     arLog "Updating Record value"
     arDdnsUpdate "$1" "$2" "$recordId" "$recordType" "$hostIp"
+    errCode=$?
+
+    if [ $errCode -eq 0 ]; then
+        arStatusSuccess="${arStatusSuccess}${domainLabel}(${recordType}): updated;"
+    elif [ $errCode -eq $arErrCodeUnchanged ]; then
+        arStatusSuccess="${arStatusSuccess}${domainLabel}(${recordType}): unchanged;"
+    else
+        arStatusFailed="${arStatusFailed}${domainLabel}(${recordType}): update failed;"
+        arNotify "FAILED: $domainLabel ($recordType) - DDNS update failed"
+    fi
+
+    return $errCode
 
 }
 
@@ -466,6 +616,57 @@ arDdnsCreate() {
 
     arLog "> arDdnsCreate - created: $4"
     echo $recordId
+
+}
+
+################################################################### status report ##
+
+# Reset status tracking (call before running checks)
+
+arStatusReset() {
+
+    arStatusSuccess=""
+    arStatusFailed=""
+
+}
+
+# Print a summary of all DDNS check results
+# Returns 0 if all succeeded, 1 if any failed
+
+arStatusSummary() {
+
+    arLog "========================================="
+    arLog "========== DDNS Update Summary =========="
+    arLog "========================================="
+
+    if [ -n "$arStatusSuccess" ]; then
+        arLog "[SUCCESS]"
+        # Split by semicolons and print each entry
+        echo "$arStatusSuccess" | tr ';' '\n' | while read -r entry; do
+            if [ -n "$entry" ]; then
+                arLog "  ✓ $entry"
+            fi
+        done
+    fi
+
+    if [ -n "$arStatusFailed" ]; then
+        arLog "[FAILED]"
+        echo "$arStatusFailed" | tr ';' '\n' | while read -r entry; do
+            if [ -n "$entry" ]; then
+                arLog "  ✗ $entry"
+            fi
+        done
+
+        # Send a summary notification if there were failures
+        arNotify "Summary - Some DDNS updates failed: $arStatusFailed"
+
+        arLog "========================================="
+        return 1
+    fi
+
+    arLog "All DDNS updates completed successfully."
+    arLog "========================================="
+    return 0
 
 }
 
