@@ -17,9 +17,11 @@ arToken="12345,7676f344eaeaea9074c123451234512d"
 arIp4QueryUrl="http://ipv4.rehi.org/ip"
 arIp6QueryUrl="http://ipv6.rehi.org/ip"
 
-# The temp file to store the last record ip
+# The directory to store per-domain last record ip cache files.
+# Cache files are named by domain, subdomain, and record type to
+# avoid collisions when managing multiple domains.
 
-arLastRecordFile=/tmp/ardnspod_last_record
+arLastRecordDir=/tmp/ardnspod
 
 # Return code when the last record IP is same as current host IP
 # Set this to a value other than 0 to distinguish with a successful ddns update
