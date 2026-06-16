@@ -36,6 +36,26 @@ echo "arToken=12345,7676f344eaeaea9074c123451234512d" >> ./ardnspod
 echo "arDdnsCheck test.org subdomain" >> ./ardnspod
 ```
 
+### 新增可选配置
+
+以下为本版本新增的可选项，均可在 `ddnspod.sh` 中设置；不设置时保持原有行为。
+
+- `arRetryCount` / `arRetryInterval`：请求失败（退出码非 0 或返回为空）后的重试次数与间隔秒数，默认 `3` / `3`；设 `arRetryCount=0` 关闭重试。重试覆盖取 IP 与 DNSPod 接口调用。
+- `arLogFile`：在 stderr 之外，把带时间戳的日志追加写入该文件；留空则仅输出到 stderr。
+- `arWebhookUrl`：失败通知的 webhook 地址（钉钉机器人 text 格式）。设置后，一次运行结束时若有域名失败，会汇总成**一条**消息发送。
+- `arDryRun`：设为 `1` 时只探测 IP 并打印将要执行的操作，**不调用 DNSPod 接口**（用于调试）。
+- 环境变量 `ARDNSPOD_TOKEN`：用于替代在脚本中明文写 `arToken`；若已设置则**优先于** `ddnspod.sh` 中的 `arToken`。
+
+运行结束会输出一段运行汇总（需在脚本末尾调用 `arDdnsSummary`，`ddnspod.sh` 已内置该调用）：
+
+```
+=== DDNS Summary ===
+> Success: 1
+> Failed: 1
+> [OK]   subdomain.test.org
+> [FAIL] subdomain6.test.org
+```
+
 # 最近更新
 
 2025/2/21

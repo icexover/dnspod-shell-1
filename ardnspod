@@ -37,6 +37,35 @@ export arErrCodeUnchanged=0
 
 export arIsCreateRecord=0
 
+# Number of retries after the first attempt for failed requests
+# and seconds to wait between retries. Set arRetryCount=0 to disable retrying
+
+export arRetryCount=3
+export arRetryInterval=3
+
+# Append logs to this file in addition to stderr
+# Empty means stderr only (default behavior)
+
+export arLogFile=""
+
+# Webhook url for failure notifications (DingTalk-style text payload)
+# Empty means notifications are disabled
+
+export arWebhookUrl=""
+
+# Dry-run mode
+# When set to 1, detect the ip but do NOT call the DNSPod API (no lookup/update/create)
+
+export arDryRun=0
+
+# Run summary accumulators, used by arDdnsCheck and arDdnsSummary
+
+export arSummaryOk=0
+export arSummaryFail=0
+export arSummaryDry=0
+export arSummaryDetail=""
+export arSummaryFailNames=""
+
 ################################################################### logger ##
 
 # Output log to stderr
@@ -45,6 +74,10 @@ arLog() {
 
     >&2 echo "$@"
 
+    if [ -n "$arLogFile" ]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$arLogFile" 2>/dev/null
+    fi
+
 }
 
 ################################################################### http client ##
@@ -52,7 +85,7 @@ arLog() {
 # Use curl or wget open url
 # Args: url postdata
 
-arRequest() {
+arRequestOnce() {
 
     local url="$1"
     local data="$2"
@@ -83,6 +116,67 @@ arRequest() {
     fi
 
     return 1
+
+}
+
+# Call arRequestOnce with automatic retries on failure
+# A failure is a non-zero exit code or empty output
+# Args: url postdata
+
+arRequest() {
+
+    local url="$1"
+    local data="$2"
+
+    local result
+    local code
+    local attempt=0
+    local maxRetry="${arRetryCount:-0}"
+
+    while :; do
+        result=$(arRequestOnce "$url" "$data")
+        code=$?
+        if [ $code -eq 0 ] && [ -n "$result" ]; then
+            echo "$result"
+            return 0
+        fi
+        if [ "$attempt" -ge "$maxRetry" ]; then
+            echo "$result"
+            return $code
+        fi
+        attempt=$((attempt + 1))
+        arLog "> arRequest - attempt $attempt/$maxRetry failed, retrying in ${arRetryInterval}s"
+        sleep "${arRetryInterval:-3}"
+    done
+
+}
+
+# Send a failure notification via webhook (DingTalk-style text payload)
+# Does nothing when arWebhookUrl is empty
+# Args: message
+
+arNotify() {
+
+    local message="$1"
+
+    if [ -z "$arWebhookUrl" ]; then
+        return 0
+    fi
+
+    local agent="AnripDdns/6.5.0(wang@rehiy.com)"
+    local payload="{\"msgtype\":\"text\",\"text\":{\"content\":\"$message\"}}"
+
+    if type curl >/dev/null 2>&1; then
+        curl -s -A "$agent" -H "Content-Type: application/json" -d "$payload" "$arWebhookUrl" >/dev/null 2>&1
+        return 0
+    fi
+
+    if type wget >/dev/null 2>&1; then
+        wget -qO- -U "$agent" --header="Content-Type: application/json" --post-data "$payload" "$arWebhookUrl" >/dev/null 2>&1
+        return 0
+    fi
+
+    return 0
 
 }
 
@@ -272,8 +366,9 @@ arDevIp6() {
 
 arDdnsApi() {
 
+    local token="${ARDNSPOD_TOKEN:-$arToken}"
     local dnsapi="https://dnsapi.cn/${1:?'Info.Version'}"
-    local params="login_token=$arToken&format=json&lang=en&$2"
+    local params="login_token=$token&format=json&lang=en&$2"
 
     arRequest "$dnsapi" "$params"
 
@@ -372,10 +467,64 @@ arDdnsUpdate() {
 
 ################################################################### task hub ##
 
-# DDNS Check
+# Record a per-domain result into the run summary
+# Args: status(OK|FAIL|DRY) name
+
+arRecord() {
+
+    case "$1" in
+        OK)
+            arSummaryOk=$((arSummaryOk + 1))
+            arSummaryDetail="$arSummaryDetail\n> [OK]   $2"
+        ;;
+        DRY)
+            arSummaryDry=$((arSummaryDry + 1))
+            arSummaryDetail="$arSummaryDetail\n> [DRY]  $2"
+        ;;
+        *)
+            arSummaryFail=$((arSummaryFail + 1))
+            arSummaryDetail="$arSummaryDetail\n> [FAIL] $2"
+            arSummaryFailNames="$arSummaryFailNames $2"
+        ;;
+    esac
+
+}
+
+# DDNS Check, records the result into the run summary
 # Args: domain subdomain [6|4] interface
 
 arDdnsCheck() {
+
+    local errCode
+    local name="$2.$1"
+
+    if [ "$2" = "@" ]; then
+        name="$1"
+    fi
+
+    arDdnsCheckOnce "$@"
+    errCode=$?
+
+    if [ "$arDryRun" = "1" ]; then
+        if [ $errCode -eq 0 ]; then
+            arRecord DRY "$name"
+        else
+            arRecord FAIL "$name"
+        fi
+    elif [ $errCode -eq 0 ] || [ $errCode -eq "$arErrCodeUnchanged" ]; then
+        arRecord OK "$name"
+    else
+        arRecord FAIL "$name"
+    fi
+
+    return $errCode
+
+}
+
+# DDNS Check implementation
+# Args: domain subdomain [6|4] interface
+
+arDdnsCheckOnce() {
 
     local errCode
 
@@ -413,6 +562,11 @@ arDdnsCheck() {
         return $errCode
     fi
 
+    if [ "$arDryRun" = "1" ]; then
+        arLog "> Dry-run: would set $recordType $2.$1 -> ${hostIp:-Auto} (no DNSPod API call)"
+        return 0
+    fi
+
     arLog "Fetching RecordId"
     recordId=$(arDdnsLookup "$1" "$2" "$recordType")
 
@@ -437,6 +591,36 @@ arDdnsCheck() {
 
     arLog "Updating Record value"
     arDdnsUpdate "$1" "$2" "$recordId" "$recordType" "$hostIp"
+
+}
+
+# Print a run summary and send a consolidated failure notification
+# No args
+
+arDdnsSummary() {
+
+    arLog "=== DDNS Summary ==="
+    arLog "> Success: $arSummaryOk"
+    arLog "> Failed: $arSummaryFail"
+    if [ "$arSummaryDry" -gt 0 ]; then
+        arLog "> Dry-run: $arSummaryDry"
+    fi
+
+    printf '%b\n' "$arSummaryDetail" | while IFS= read -r line; do
+        if [ -n "$line" ]; then
+            arLog "$line"
+        fi
+    done
+
+    if [ "$arSummaryFail" -gt 0 ] && [ -n "$arWebhookUrl" ]; then
+        arNotify "ArDNSPod 更新失败: $arSummaryFail 个域名 ->$arSummaryFailNames"
+    fi
+
+    arSummaryOk=0
+    arSummaryFail=0
+    arSummaryDry=0
+    arSummaryDetail=""
+    arSummaryFailNames=""
 
 }
 

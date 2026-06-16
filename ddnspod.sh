@@ -6,6 +6,9 @@ cd "$(dirname "$0")"
 . ./ardnspod
 
 # Combine your token ID and token together as follows
+# You can also provide the token via the ARDNSPOD_TOKEN environment variable
+# (e.g. `export ARDNSPOD_TOKEN="12345,7676f344..."`), which takes precedence
+# over the arToken set below and keeps the secret out of this file
 
 arToken="12345,7676f344eaeaea9074c123451234512d"
 
@@ -32,6 +35,21 @@ arErrCodeUnchanged=0
 
 arIsCreateRecord=0
 
+# Number of retries after the first attempt for failed requests, and the
+# interval in seconds between retries. Set arRetryCount=0 to disable retrying
+# arRetryCount=3
+# arRetryInterval=3
+
+# Append logs to a file in addition to stderr; empty means stderr only
+# arLogFile=/var/log/ardnspod.log
+
+# Webhook url for failure notifications (DingTalk-style robot). When set, a single
+# consolidated message is sent at the end of the run if any domain failed
+# arWebhookUrl=https://oapi.dingtalk.com/robot/send?access_token=xxxx
+
+# Dry-run: detect the ip and print what would happen without calling the DNSPod API
+# arDryRun=1
+
 # Place each domain you want to check as follows
 # you can have multiple arDdnsCheck blocks
 
@@ -40,3 +58,7 @@ arDdnsCheck "test.org" "subdomain"
 
 # IPv6:
 arDdnsCheck "test.org" "subdomain6" 6
+
+# Print a run summary (which domains succeeded/failed) and, if arWebhookUrl is
+# set, send a single consolidated failure notification
+arDdnsSummary
