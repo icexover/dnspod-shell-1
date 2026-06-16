@@ -57,28 +57,29 @@ arRequest() {
     local url="$1"
     local data="$2"
 
-    local params=""
     local agent="AnripDdns/6.5.0(wang@rehiy.com)"
 
     if type curl >/dev/null 2>&1; then
-        if echo $url | grep -q https; then
-            params="$params -k"
-        fi
+        set -- -s -A "$agent"
+        case "$url" in
+            https://*) set -- "$@" -k ;;
+        esac
         if [ -n "$data" ]; then
-            params="$params -d $data"
+            set -- "$@" -d "$data"
         fi
-        curl -s -A "$agent" $params $url
+        curl "$@" "$url"
         return $?
     fi
 
     if type wget >/dev/null 2>&1; then
-        if echo $url | grep -q https; then
-            params="$params --no-check-certificate"
-        fi
+        set -- -qO- -U "$agent"
+        case "$url" in
+            https://*) set -- "$@" --no-check-certificate ;;
+        esac
         if [ -n "$data" ]; then
-            params="$params --post-data $data"
+            set -- "$@" --post-data "$data"
         fi
-        wget -qO- -U "$agent" $params $url
+        wget "$@" "$url"
         return $?
     fi
 
@@ -123,7 +124,7 @@ arWanIp4() {
             hostIp=$(ip -o -4 route get 100.64.0.1 | grep -oE 'src [0-9\.]+' | awk '{print $2}' | grep -Ev "$lanIps")
         ;;
         Darwin|FreeBSD)
-            hostIp=$(ifconfig | grep "inet " | grep -v 127.0.0.1 | awk '{print $2}' | grep -Ev "$lanIps")
+            hostIp=$(ifconfig | grep "inet " | grep -v 127.0.0.1 | awk '{print $2}' | grep -Ev "$lanIps" | head -n 1)
         ;;
     esac
 
@@ -154,7 +155,7 @@ arDevIp4() {
 
     case $(uname) in
         'Linux')
-            hostIp=$(ip -o -4 addr show dev $1 primary | grep -oE 'inet [0-9.]+' | awk '{print $2}' | grep -Ev "$lanIps" | head -n 1)
+            hostIp=$(ip -o -4 addr show dev "$1" primary | grep -oE 'inet [0-9.]+' | awk '{print $2}' | grep -Ev "$lanIps" | head -n 1)
         ;;
     esac
 
@@ -234,18 +235,18 @@ arDevIp6() {
     case $(uname) in
         'Linux')
             # Try obtain home address (a speical permanent address for mobile devices)
-            hostIp=$(ip -o -6 addr show dev $1 scope global home | grep -oE 'inet6 [0-9a-fA-F:]+' | awk '{print $2}' | grep -Ev "$lanIps")
+            hostIp=$(ip -o -6 addr show dev "$1" scope global home | grep -oE 'inet6 [0-9a-fA-F:]+' | awk '{print $2}' | grep -Ev "$lanIps")
             if [ -z "$hostIp" ]; then # Try obtain permanent address
-                hostIp=$(ip -o -6 addr show dev $1 scope global permanent | grep -oE 'inet6 [0-9a-fA-F:]+' | awk '{print $2}' | grep -Ev "$lanIps")
+                hostIp=$(ip -o -6 addr show dev "$1" scope global permanent | grep -oE 'inet6 [0-9a-fA-F:]+' | awk '{print $2}' | grep -Ev "$lanIps")
             fi
             if [ -z "$hostIp" ]; then # Try obtain non-deprecated primary (non-temporary) non-mngtmpaddr (mngtmpaddr is template for temporary address creation) address then
-                hostIp=$(ip -o -6 addr show dev $1 scope global -deprecated primary | grep -v mngtmpaddr | grep -oE 'inet6 [0-9a-fA-F:]+' | awk '{print $2}' | grep -Ev "$lanIps")
+                hostIp=$(ip -o -6 addr show dev "$1" scope global -deprecated primary | grep -v mngtmpaddr | grep -oE 'inet6 [0-9a-fA-F:]+' | awk '{print $2}' | grep -Ev "$lanIps")
             fi
             if [ -z "$hostIp" ]; then # Try obtain non-deprecated primary address then
-                hostIp=$(ip -o -6 addr show dev $1 scope global -deprecated primary | grep -oE 'inet6 [0-9a-fA-F:]+' | awk '{print $2}' | grep -Ev "$lanIps")
+                hostIp=$(ip -o -6 addr show dev "$1" scope global -deprecated primary | grep -oE 'inet6 [0-9a-fA-F:]+' | awk '{print $2}' | grep -Ev "$lanIps")
             fi
             if [ -z "$hostIp" ]; then # Try obtain non-deprecated address any at last
-                hostIp=$(ip -o -6 addr show dev $1 scope global -deprecated | grep -oE 'inet6 [0-9a-fA-F:]+' | awk '{print $2}' | grep -Ev "$lanIps")
+                hostIp=$(ip -o -6 addr show dev "$1" scope global -deprecated | grep -oE 'inet6 [0-9a-fA-F:]+' | awk '{print $2}' | grep -Ev "$lanIps")
             fi
             hostIp=$(echo "$hostIp" | head -n 1) # Fetch at most one address
         ;;
@@ -262,6 +263,22 @@ arDevIp6() {
     fi
 
     echo $hostIp
+
+}
+
+################################################################### json util ##
+
+# Extract the first value of a JSON key (string or number)
+# Tolerant of surrounding whitespace and key order; first match wins
+# Args: json key
+
+arJsonValue() {
+
+    printf '%s' "$1" \
+        | grep -oE "\"$2\"[[:space:]]*:[[:space:]]*(\"[^\"]*\"|[^,}[:space:]]+)" \
+        | head -n 1 \
+        | sed "s/^\"$2\"[[:space:]]*:[[:space:]]*//" \
+        | sed 's/^"//; s/"$//'
 
 }
 
@@ -285,8 +302,9 @@ arDdnsApi() {
 arDdnsLookup() {
 
     local errMsg
-
     local recordId
+    local recordRs
+    local subDomainRule=""
 
     if [ "$2" != "@" ]; then
         # No sub_domain for root domain
@@ -294,11 +312,14 @@ arDdnsLookup() {
     fi
 
     # Get Record Id
-    recordId=$(arDdnsApi "Record.List" "domain=$1${subDomainRule}&record_type=$3")
-    recordId=$(echo $recordId | sed 's/.*"id":"\([0-9]*\)".*/\1/')
+    recordRs=$(arDdnsApi "Record.List" "domain=$1${subDomainRule}&record_type=$3")
+
+    # Scope extraction to the records array so the domain id is never matched
+    recordId=$(printf '%s' "$recordRs" | sed 's/.*"records"[[:space:]]*:[[:space:]]*\[//')
+    recordId=$(arJsonValue "$recordId" id)
 
     if ! [ "$recordId" -gt 0 ] 2>/dev/null ;then
-        errMsg=$(echo $recordId | sed 's/.*"message":"\([^\"]*\)".*/\1/')
+        errMsg=$(arJsonValue "$recordRs" message)
         arLog "> arDdnsLookup - $errMsg"
         if [ $arIsCreateRecord -eq 1 ]; then
             if [ "$errMsg" = "No records on the list" ]; then
@@ -322,8 +343,11 @@ arDdnsUpdate() {
     local recordCd
     local recordIp
 
+    local recordKey
+    recordKey=$(printf '%s' "$1.$2.$4" | tr -c 'A-Za-z0-9._-' '_')
+
     local lastRecordIp
-    local lastRecordIpFile="$arLastRecordFile.$3"
+    local lastRecordIpFile="$arLastRecordFile.$recordKey.$3"
 
     # fetch last ip
     if [ -f $lastRecordIpFile ]; then
@@ -333,8 +357,8 @@ arDdnsUpdate() {
     # fetch from api
     if [ -z "$lastRecordIp" ]; then
         recordRs=$(arDdnsApi "Record.Info" "domain=$1&record_id=$3")
-        recordCd=$(echo $recordRs | sed 's/.*{"code":"\([0-9]*\)".*/\1/')
-        lastRecordIp=$(echo $recordRs | sed 's/.*,"value":"\([0-9a-fA-F\.\:]*\)".*/\1/')
+        recordCd=$(arJsonValue "$recordRs" code)
+        lastRecordIp=$(arJsonValue "$recordRs" value)
     fi
 
     # update ip
@@ -349,12 +373,12 @@ arDdnsUpdate() {
     fi
 
     # parse result
-    recordCd=$(echo $recordRs | sed 's/.*{"code":"\([0-9]*\)".*/\1/')
-    recordIp=$(echo $recordRs | sed 's/.*,"value":"\([0-9a-fA-F\.\:]*\)".*/\1/')
+    recordCd=$(arJsonValue "$recordRs" code)
+    recordIp=$(arJsonValue "$recordRs" value)
 
     # check result
     if [ "$recordCd" != "1" ]; then
-        errMsg=$(echo $recordRs | sed 's/.*,"message":"\([^"]*\)".*/\1/')
+        errMsg=$(arJsonValue "$recordRs" message)
         arLog "> arDdnsUpdate - error: $errMsg"
         return 1
     elif [ "$recordIp" = "$lastRecordIp" ]; then
@@ -449,17 +473,18 @@ arDdnsCreate() {
 
     local recordRs
     local recordCd
+    local recordId
 
     # create record
     recordRs=$(arDdnsApi "Record.Create" "domain=$1&sub_domain=$2&record_type=$3&value=$4&record_line=%e9%bb%98%e8%ae%a4")
 
     # parse result
-    recordCd=$(echo $recordRs | sed 's/.*{"code":"\([0-9]*\)".*/\1/')
-    recordId=$(echo $recordRs | sed 's/.*{"id":"\([0-9]*\)".*/\1/')
+    recordCd=$(arJsonValue "$recordRs" code)
+    recordId=$(arJsonValue "$recordRs" id)
 
     # check result
     if [ "$recordCd" != "1" ]; then
-        errMsg=$(echo $recordRs | sed 's/.*,"message":"\([^"]*\)".*/\1/')
+        errMsg=$(arJsonValue "$recordRs" message)
         arLog "> arDdnsCreate - error: $errMsg"
         return 1
     fi
