@@ -37,6 +37,16 @@ export arErrCodeUnchanged=0
 
 export arIsCreateRecord=0
 
+################################################################### error codes ##
+
+# Named return codes (values preserved for backward compatibility)
+
+arErrOk=0
+arErrFail=1
+arErrIpAuto=2          # IPv4 resolver: no local IP, let DNSPod auto-fill (call-site meaning)
+arErrRecordAbsent=2    # record lookup: record missing when arIsCreateRecord=1 (call-site meaning)
+arErrNoHttpClient=127  # neither curl nor wget available
+
 ################################################################### logger ##
 
 # Output log to stderr
@@ -82,7 +92,7 @@ arRequest() {
         return $?
     fi
 
-    return 1
+    return $arErrNoHttpClient
 
 }
 
@@ -132,12 +142,12 @@ arWanIp4() {
     fi
 
     if [ -z "$hostIp" ]; then
-        return 2
+        return $arErrIpAuto
     fi
 
     if [ -z "$(echo $hostIp | grep -E '^[0-9\.]+$')" ]; then
         arLog "> arWanIp4 - Invalid ip address"
-        return 1
+        return $arErrFail
     fi
 
     echo $hostIp
@@ -160,12 +170,12 @@ arDevIp4() {
 
     if [ -z "$hostIp" ]; then
         arLog "> arDevIp4 - Can't get ip address"
-        return 1
+        return $arErrFail
     fi
 
     if [ -z "$(echo $hostIp | grep -E '^[0-9\.]+$')" ]; then
         arLog "> arDevIp4 - Invalid ip address"
-        return 1
+        return $arErrFail
     fi
 
     echo $hostIp
@@ -211,12 +221,12 @@ arWanIp6() {
 
     if [ -z "$hostIp" ]; then
         arLog "> arWanIp6 - Can't get ip address"
-        return 1
+        return $arErrFail
     fi
 
     if [ -z "$(echo $hostIp | grep -E '^[0-9a-fA-F:]+$')" ]; then
         arLog "> arWanIp6 - Invalid ip address"
-        return 1
+        return $arErrFail
     fi
 
     echo $hostIp
@@ -253,15 +263,57 @@ arDevIp6() {
 
     if [ -z "$hostIp" ]; then
         arLog "> arDevIp6 - Can't get ip address"
-        return 1
+        return $arErrFail
     fi
 
     if [ -z "$(echo $hostIp | grep -E '^[0-9a-fA-F:]+$')" ]; then
         arLog "> arDevIp6 - Invalid ip address"
-        return 1
+        return $arErrFail
     fi
 
     echo $hostIp
+
+}
+
+################################################################### ip dispatch ##
+
+# Fetch host ip via interface or wan resolver
+# Args: ipVersion(6|4) interface   -> echoes ip, returns resolver's code
+
+arFetchHostIp() {
+
+    if   [ "$1" = "6" ] && [ -n "$2" ]; then
+        arDevIp6 "$2"
+    elif [ "$1" = "4" ] && [ -n "$2" ]; then
+        arDevIp4 "$2"
+    elif [ "$1" = "6" ]; then
+        arWanIp6
+    else
+        arWanIp4
+    fi
+
+}
+
+################################################################### json util ##
+
+# Parse a DNSPod JSON response. Each helper keeps the exact sed anchor that
+# disambiguates which occurrence is matched; do not merge differing anchors.
+
+arJsonCode() {
+
+    echo "$1" | sed 's/.*{"code":"\([0-9]*\)".*/\1/'
+
+}
+
+arJsonValue() {
+
+    echo "$1" | sed 's/.*,"value":"\([0-9a-fA-F\.\:]*\)".*/\1/'
+
+}
+
+arJsonMessage() {
+
+    echo "$1" | sed 's/.*,"message":"\([^"]*\)".*/\1/'
 
 }
 
@@ -288,6 +340,8 @@ arDdnsLookup() {
 
     local recordId
 
+    local subDomainRule=""
+
     if [ "$2" != "@" ]; then
         # No sub_domain for root domain
         subDomainRule="&sub_domain=$2"
@@ -302,10 +356,10 @@ arDdnsLookup() {
         arLog "> arDdnsLookup - $errMsg"
         if [ $arIsCreateRecord -eq 1 ]; then
             if [ "$errMsg" = "No records on the list" ]; then
-                return 2
+                return $arErrRecordAbsent
             fi
         fi
-        return 1
+        return $arErrFail
     fi
 
     echo $recordId
@@ -333,8 +387,8 @@ arDdnsUpdate() {
     # fetch from api
     if [ -z "$lastRecordIp" ]; then
         recordRs=$(arDdnsApi "Record.Info" "domain=$1&record_id=$3")
-        recordCd=$(echo $recordRs | sed 's/.*{"code":"\([0-9]*\)".*/\1/')
-        lastRecordIp=$(echo $recordRs | sed 's/.*,"value":"\([0-9a-fA-F\.\:]*\)".*/\1/')
+        recordCd=$(arJsonCode "$recordRs")
+        lastRecordIp=$(arJsonValue "$recordRs")
     fi
 
     # update ip
@@ -349,14 +403,14 @@ arDdnsUpdate() {
     fi
 
     # parse result
-    recordCd=$(echo $recordRs | sed 's/.*{"code":"\([0-9]*\)".*/\1/')
-    recordIp=$(echo $recordRs | sed 's/.*,"value":"\([0-9a-fA-F\.\:]*\)".*/\1/')
+    recordCd=$(arJsonCode "$recordRs")
+    recordIp=$(arJsonValue "$recordRs")
 
     # check result
     if [ "$recordCd" != "1" ]; then
-        errMsg=$(echo $recordRs | sed 's/.*,"message":"\([^"]*\)".*/\1/')
+        errMsg=$(arJsonMessage "$recordRs")
         arLog "> arDdnsUpdate - error: $errMsg"
-        return 1
+        return $arErrFail
     elif [ "$recordIp" = "$lastRecordIp" ]; then
         arLog "> arDdnsUpdate - unchanged: $recordIp" # unchanged event
         return $arErrCodeUnchanged
@@ -365,7 +419,7 @@ arDdnsUpdate() {
         if [ -n "$lastRecordIpFile" ]; then
             echo $recordIp > $lastRecordIpFile
         fi
-        return 0
+        return $arErrOk
     fi
 
 }
@@ -387,25 +441,16 @@ arDdnsCheck() {
     arLog "=== Check $2.$1 ==="
     arLog "Fetching Host Ip"
 
-    if   [ "$3" = "6" ] && [ -n "$4" ]; then
-        recordType=AAAA
-        hostIp=$(arDevIp6 "$4")
-    elif [ "$3" = "4" ] && [ -n "$4" ]; then
-        recordType=A
-        hostIp=$(arDevIp4 "$4")
-    elif [ "$3" = "6" ]; then
-        recordType=AAAA
-        hostIp=$(arWanIp6)
-    else
-        recordType=A
-        hostIp=$(arWanIp4)
-    fi
+    recordType=A
+    [ "$3" = "6" ] && recordType=AAAA
+
+    hostIp=$(arFetchHostIp "$3" "$4")
 
     errCode=$?
-    if [ $errCode -eq 0 ]; then
+    if [ $errCode -eq $arErrOk ]; then
         arLog "> Host Ip: $hostIp"
         arLog "> Record Type: $recordType"
-    elif [ $errCode -eq 2 ]; then
+    elif [ $errCode -eq $arErrIpAuto ]; then
         arLog "> Host Ip: Auto"
         arLog "> Record Type: $recordType"
     else
@@ -417,15 +462,15 @@ arDdnsCheck() {
     recordId=$(arDdnsLookup "$1" "$2" "$recordType")
 
     errCode=$?
-    if [ $errCode -eq 0 ]; then
+    if [ $errCode -eq $arErrOk ]; then
         arLog "> Record Id: $recordId"
-    elif [ $errCode -eq 2  ]; then
+    elif [ $errCode -eq $arErrRecordAbsent ]; then
         arLog "Creating Record value"
         recordId=$(arDdnsCreate "$1" "$2" "$recordType" "$hostIp")
         errCode=$?
-        if [ $errCode -eq 0 ]; then
+        if [ $errCode -eq $arErrOk ]; then
             arLog "> Record Id: $recordId"
-            return 0
+            return $arErrOk
         else
             arLog "$recordId"
             return $errCode
@@ -449,19 +494,20 @@ arDdnsCreate() {
 
     local recordRs
     local recordCd
+    local recordId
 
     # create record
     recordRs=$(arDdnsApi "Record.Create" "domain=$1&sub_domain=$2&record_type=$3&value=$4&record_line=%e9%bb%98%e8%ae%a4")
 
     # parse result
-    recordCd=$(echo $recordRs | sed 's/.*{"code":"\([0-9]*\)".*/\1/')
+    recordCd=$(arJsonCode "$recordRs")
     recordId=$(echo $recordRs | sed 's/.*{"id":"\([0-9]*\)".*/\1/')
 
     # check result
     if [ "$recordCd" != "1" ]; then
-        errMsg=$(echo $recordRs | sed 's/.*,"message":"\([^"]*\)".*/\1/')
+        errMsg=$(arJsonMessage "$recordRs")
         arLog "> arDdnsCreate - error: $errMsg"
-        return 1
+        return $arErrFail
     fi
 
     arLog "> arDdnsCreate - created: $4"
